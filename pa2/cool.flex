@@ -51,6 +51,8 @@ char *last_text_token = NULL;
 int last_text_token_len = 0;
 int last_text_token_buffer_size = 0;
 
+bool suppress_string_for_error = false;
+
 int comment_nesting_level = 0;
 
 
@@ -75,12 +77,13 @@ SELF            [:@,;(){}=<~/\-\*\+\.]
   *  Nested comments
   */
 
-<INITIAL>\(\*           { BEGIN(comment); }
+<INITIAL>\(\*           { comment_nesting_level++; BEGIN(comment); }
 <comment>\(\*           { comment_nesting_level++; }
-<comment>\*\)           { if (comment_nesting_level-- <= 1) { BEGIN(0); } }
+<comment>\*\)           { comment_nesting_level--; if (comment_nesting_level < 1) { BEGIN(0); } }
 <comment>\n             { NEWLINE; }
-<comment><<EOF>>        { cool_yylval.error_msg = "EOF in comment"; return ERROR; }
+<comment><<EOF>>        { cool_yylval.error_msg = "EOF in comment"; BEGIN(0); return ERROR; }
 <comment>.              { /* no-op, ignore everything in comment */ }
+<INITIAL>\*\)           { cool_yylval.error_msg = "Unmatched *)"; return ERROR; }
 
 <INITIAL>--.*           { /* no-op, comment to EOL */ }
 
@@ -88,6 +91,7 @@ SELF            [:@,;(){}=<~/\-\*\+\.]
   *  The multiple-character operators.
   */
 <INITIAL>=>     		{ return DARROW; }
+<INITIAL><=     		{ return LE; }
 <INITIAL><-     		{ return ASSIGN; }
 
  /*
@@ -111,18 +115,7 @@ SELF            [:@,;(){}=<~/\-\*\+\.]
 <INITIAL>(?i:of)         { return OF; }
 <INITIAL>(?i:new)        { return NEW; }
 <INITIAL>(?i:isvoid)     { return ISVOID; }
-
-<INITIAL>[a-z][a-zA-Z0-9_]+ { cool_yylval.symbol = inttable.add_string(yytext); return OBJECTID; }
-<INITIAL>[A-Z][a-zA-Z0-9_]+ { cool_yylval.symbol = inttable.add_string(yytext); return TYPEID; }
-
-<INITIAL>{SELF}         { return *(yytext); /* shady as hell, but seems to be what's expected, so wtf. */ }
-
- /*
-  *  String constants (C syntax)
-  *  Escape sequence \c is accepted for all characters c. Except for 
-  *  \n \t \b \f, the result is c.
-  *
-  */
+<INITIAL>(?i:not)        { return NOT; }
 
 <INITIAL>f(?i:alse)      {
                     cool_yylval.boolean = 0;
@@ -133,6 +126,18 @@ SELF            [:@,;(){}=<~/\-\*\+\.]
                     return BOOL_CONST;
                 }
 
+<INITIAL>[a-z][a-zA-Z0-9_]* { cool_yylval.symbol = inttable.add_string(yytext); return OBJECTID; }
+<INITIAL>[A-Z][a-zA-Z0-9_]* { cool_yylval.symbol = inttable.add_string(yytext); return TYPEID; }
+
+<INITIAL>{SELF}         { return *(yytext); /* shady as hell, but seems to be what's expected, so wtf. */ }
+
+ /*
+  *  String constants (C syntax)
+  *  Escape sequence \c is accepted for all characters c. Except for 
+  *  \n \t \b \f, the result is c.
+  *
+  */
+
 <INITIAL>[0-9]+          {
                     cool_yylval.symbol = inttable.add_string(yytext);
                     return INT_CONST;
@@ -141,19 +146,36 @@ SELF            [:@,;(){}=<~/\-\*\+\.]
 <INITIAL>\"     {
                     BEGIN(string);
                 }
-<string>[^\\"\n]  { append_to_text_token_buffer(yytext, yyleng); /* should always be 1 byte but w/e */ }
-<string>\n      { BEGIN(0); cool_yylval.error_msg = "Unterminated string constant"; NEWLINE; return ERROR; }
+<string>[^\\"\n\x00]  { append_to_text_token_buffer(yytext, yyleng); /* should always be 1 byte but w/e */ }
+<string>\n      {
+                    BEGIN(0);
+                    cool_yylval.error_msg = "Unterminated string constant";
+                    NEWLINE;
+                    if (last_text_token != NULL) free(last_text_token);
+                    last_text_token = NULL;
+                    last_text_token_len = 0; last_text_token_buffer_size = 0;
+                    return ERROR; }
 <string>\"      {
                     BEGIN(0);
-                    if (last_text_token == NULL) {
-                        cool_yylval.symbol = inttable.add_string(""); // empty buffer means empty string, which is fine
-                    } else {
-                        cool_yylval.symbol = inttable.add_string(last_text_token);
-                        free(last_text_token); last_text_token = NULL;
+                    if (suppress_string_for_error) {
+                        if (last_text_token != NULL) free(last_text_token);
+                        last_text_token = NULL;
                         last_text_token_len = 0; last_text_token_buffer_size = 0;
+                    } else {
+                        if (last_text_token == NULL) {
+                            cool_yylval.symbol = inttable.add_string(""); // empty buffer means empty string, which is fine
+                        } else {
+                            cool_yylval.symbol = inttable.add_string(last_text_token);
+                            free(last_text_token); last_text_token = NULL;
+                            last_text_token_len = 0; last_text_token_buffer_size = 0;
+                        }
+                        return STR_CONST;
                     }
-                    return STR_CONST;
                 }
+<string,s_esc><<EOF>> { cool_yylval.error_msg = "EOF in string constant"; BEGIN(0); return ERROR; }
+<string>\x00    { suppress_string_for_error = true; cool_yylval.error_msg = "String contains null character."; return ERROR; }
+<s_esc>\x00    { suppress_string_for_error = true; cool_yylval.error_msg = "String contains escaped null character."; return ERROR; }
+                
    /* deal with escapes */
 <string>\\      { BEGIN(s_esc); }
 <s_esc>\n       { NEWLINE; append_to_text_token_buffer("\n", 1); BEGIN(string); }
@@ -193,6 +215,7 @@ void append_to_text_token_buffer(char *text, int len) {
     //}
     last_text_token_len += len;
 }
+
 
 
 
